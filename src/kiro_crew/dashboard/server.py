@@ -1393,9 +1393,7 @@ async def _start_unix_site(runner: web.AppRunner, port: int) -> Path | None:
         logger.info("dashboard internal API also listening on unix socket %s", path)
         return path
     except Exception as exc:
-        logger.warning(
-            "dashboard unix socket unavailable (%s); internal API stays TCP-only", exc
-        )
+        logger.warning("dashboard unix socket unavailable (%s); internal API stays TCP-only", exc)
         return None
 
 
@@ -1724,6 +1722,51 @@ def _dispatch_owner_dm(state: DashboardState, text: str) -> None:
     task = loop.create_task(_dm_owner(state, text))
     state._background_tasks.add(task)
     task.add_done_callback(state._background_tasks.discard)
+
+
+def _register_devcontainer_routes(app: web.Application) -> None:
+    """Register the Dev Container endpoints for a gateway that opted in.
+
+    The handler module is imported on the FIRST REQUEST, not here, so boot never
+    loads the optional subsystem under any combination of the two locks --
+    including the common one where the environment gate is set but
+    ``agent.devcontainer`` is still ``off``. Gating the import on the locks
+    instead would make the route table depend on config, which is read live: an
+    operator flipping the config on would then need a gateway restart to get the
+    endpoints, and readiness would still pay the import whenever both were open.
+    Deferring to first use is what makes "not on the boot path" true rather than
+    true-for-now.
+
+    The environment gate still decides whether the routes EXIST, because that
+    value is fixed for the process lifetime. Both locks are enforced inside the
+    handlers, which report the feature as disabled rather than acting.
+    """
+    from kiro_crew.constants import DEVCONTAINER_ENV_VAR, env_flag_enabled
+
+    # Checked before any devcontainer import: importing to read the gate would
+    # load the whole subsystem to decide not to use it.
+    if not env_flag_enabled(DEVCONTAINER_ENV_VAR):
+        logger.debug(
+            "dashboard: Dev Container routes not registered (%s is not set)",
+            DEVCONTAINER_ENV_VAR,
+        )
+        return
+
+    def _lazy(handler_name: str) -> Callable[[web.Request], Awaitable[web.StreamResponse]]:
+        async def _dispatch(request: web.Request) -> web.StreamResponse:
+            from kiro_crew.dashboard.handlers import devcontainer as handlers
+
+            handler = getattr(handlers, handler_name)
+            return await handler(request)
+
+        _dispatch.__name__ = handler_name
+        return _dispatch
+
+    app.router.add_get("/api/devcontainer/status", _lazy("api_devcontainer_status"))
+    app.router.add_get("/api/devcontainer/config", _lazy("api_devcontainer_config"))
+    app.router.add_post("/api/devcontainer/trust", _lazy("api_devcontainer_trust"))
+    app.router.add_delete("/api/devcontainer/trust", _lazy("api_devcontainer_untrust"))
+    app.router.add_post("/api/devcontainer/rebuild", _lazy("api_devcontainer_rebuild"))
 
 
 def _register_instances_hooks(app: web.Application, state: DashboardState, port: int) -> None:
@@ -2700,6 +2743,7 @@ async def start_dashboard(
     # Follow-up suggestion card (suggest_followup MCP tool -> card below composer)
     app.router.add_post("/api/chat/slots/{slot}/followup", chat.api_chat_slot_followup)
     app.router.add_post("/api/worktree/create", api_worktree_create)
+    _register_devcontainer_routes(app)
     app.router.add_get("/api/recent-projects", chat.api_recent_projects)
     app.router.add_patch("/api/chat/slots/{slot}/color", chat.api_chat_slot_color)
     # Context injection (App Kit — silent background context)
