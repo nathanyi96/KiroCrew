@@ -136,15 +136,46 @@ def _get_config(request: web.Request) -> dict:
         return {}
 
 
+def _governance_allows_terminal() -> bool:
+    """Read the governed ``boot.allow_terminal`` pin.
+
+    ``True`` unless a policy explicitly wrote ``allow_terminal: false``.  An
+    unwritten key is "no opinion" and must not disable the panel — the key
+    declared ``False`` as its default for its whole un-consumed life, so binding
+    that default would silently remove the terminal from every governed host
+    (see ``BootControls``).
+
+    Scope, stated honestly: this disables the SURFACE. It does not govern the
+    PTY — a permitted terminal still spawns an intentionally unsandboxed shell
+    with no per-command governance call.
+    """
+    try:
+        from kiro_crew.platform.context import current_context
+
+        boot = getattr(getattr(current_context(), "governance", None), "boot", None)
+        return getattr(boot, "allow_terminal", None) is not False
+    except Exception:
+        # Availability posture matches the config read below: a transient
+        # context error must not take the panel down on an ungoverned host.
+        return True
+
+
 def _is_enabled(request: web.Request) -> bool:
     """Terminal panel is enabled by default. Disable via config.json:
     {"dashboard": {"terminal": {"enabled": false}}}
+    ...or fleet-wide via an enterprise policy pinning ``boot.allow_terminal:
+    false``, which the running app cannot re-enable.
     Cached for 30s to avoid disk I/O per request.
+
+    Every terminal route gates on this one function, so a deny here disables the
+    whole feature — and ``api_terminal_list`` already reports ``enabled: false``,
+    which the frontend uses to hide the Terminal entry entirely rather than
+    leaving a dead panel.
     """
     now = time.monotonic()
     if now - _enabled_cache[1] < 30:
         return _enabled_cache[0]
-    result = bool(_get_config(request).get("enabled", True))
+    result = bool(_get_config(request).get("enabled", True)) and _governance_allows_terminal()
     _enabled_cache[0] = result
     _enabled_cache[1] = now
     return result

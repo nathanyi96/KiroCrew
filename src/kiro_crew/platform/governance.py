@@ -1128,10 +1128,30 @@ def register_scope(name: str, spec: ScopeSpec) -> None:
 # ──────────────────────────────────────────────────────────────────────────
 @dataclass(frozen=True)
 class BootControls:
-    """Policy-only boot constraints (not a governed scope; checked at startup)."""
+    """Policy-only boot constraints (not a governed scope; checked at startup).
 
-    require_sandbox: bool = True
-    allow_terminal: bool = False
+    ``require_sandbox`` and ``allow_terminal`` are **tri-state**: ``None`` means
+    the policy did not write the key, and an unwritten key must preserve today's
+    behaviour rather than bind its declared default.
+
+    That distinction is load-bearing, not stylistic.  These keys were parsed but
+    consumed by nothing for their whole life, so their declared defaults were
+    never pressure-tested against a real fleet.  Binding them as declared would
+    have changed behaviour for every existing governed policy: ``allow_terminal``
+    defaulted to ``False``, so consuming it would silently remove the web
+    terminal from every governed host, and ``require_sandbox`` defaulted to
+    ``True``, so consuming it would newly fail-closed every governed host that
+    relies on the ``sandbox_allow_unsandboxed_exec`` escape.  Absence therefore
+    means "no opinion" — the same rule the governed scopes already follow, where
+    a control the policy does not name is ungoverned.
+
+    ``fail_closed`` stays a plain ``bool`` because ``parse_policy`` rejects
+    ``false`` outright: boot already aborts unconditionally, so the only honest
+    values are "declared true" and "not declared".
+    """
+
+    require_sandbox: Optional[bool] = None
+    allow_terminal: Optional[bool] = None
     fail_closed: bool = True
 
 
@@ -1528,9 +1548,37 @@ def parse_policy(
     boot_raw = data.get("boot")
     if not isinstance(boot_raw, dict):
         raise PlatformCompositionError("security policy requires a 'boot' object")
+    # ``boot`` was the ONE block that silently ignored unknown keys while every
+    # archetype rejects a typo fail-closed.  Harmless while nothing consumed it;
+    # a silent security hole now that ``require_sandbox`` binds, because
+    # ``{"require_sandbxo": true}`` would read as "no opinion" and the operator
+    # would believe the fail-open escape was forbidden.
+    _reject_unknown_keys(
+        boot_raw, {"require_sandbox", "allow_terminal", "fail_closed"}, "boot"
+    )
+    # ``fail_closed: false`` is refused rather than honoured.  Boot already
+    # aborts unconditionally on an unreadable policy or a weakening profile
+    # ordinal, so the key cannot relax anything; wiring it would turn it into a
+    # switch that lets a fleet boot ungoverned, which is an anti-feature in a
+    # security ceiling.  Refusing is louder than silently ignoring, and leaves
+    # the door open for a separately-named runtime-polarity control later.
+    if boot_raw.get("fail_closed") is False:
+        raise PlatformCompositionError(
+            "boot.fail_closed cannot be set to false: boot is unconditionally "
+            "fail-closed (an unreadable policy or a profile looser than the "
+            "ceiling aborts startup regardless of this key). Remove the key, or "
+            "set it to true to declare the posture explicitly."
+        )
     boot = BootControls(
-        require_sandbox=bool(boot_raw.get("require_sandbox", True)),
-        allow_terminal=bool(boot_raw.get("allow_terminal", False)),
+        # Tri-state: absent means "no opinion", NOT the declared default.  See
+        # BootControls' docstring for why binding the declared defaults would
+        # have changed behaviour for every existing governed policy.
+        require_sandbox=(
+            bool(boot_raw["require_sandbox"]) if "require_sandbox" in boot_raw else None
+        ),
+        allow_terminal=(
+            bool(boot_raw["allow_terminal"]) if "allow_terminal" in boot_raw else None
+        ),
         fail_closed=bool(boot_raw.get("fail_closed", True)),
     )
     controls = _parse_controls(data, is_policy=True)
