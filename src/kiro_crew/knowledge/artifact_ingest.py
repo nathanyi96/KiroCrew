@@ -60,7 +60,7 @@ from kiro_crew.security import (
 )
 from kiro_crew.sel import sel
 
-from .ingestion import DUPLICATE_JOB_STATUS, IngestionPipeline
+from .ingestion import DUPLICATE_JOB_STATUS, IngestionPipeline, run_to_completion
 from .store import KnowledgeStore
 
 logger = logging.getLogger(__name__)
@@ -154,6 +154,46 @@ def _get_state(
     return row["content_hash"], ids
 
 
+def _record_deduped_state(
+    kstore: KnowledgeStore,
+    source_id: str,
+    slug: str,
+    content_hash: str,
+    name: str,
+    kind: str | None,
+) -> None:
+    """Terminal write for an artifact the pre-ingest gate refused, under the lock.
+
+    The gate commits its own transaction before returning, so a concurrent
+    ``delete_source_cascade`` on the holder can land between that commit and this
+    write: it reassigns the surviving item to this source and adopts it into this
+    very ``artifact_item_state`` row. Writing an empty group afterwards -- which
+    "the gate refused, so this artifact owns nothing" predicts -- erases the
+    adoption and leaves the last copy of the content owned by this source but
+    named by no row, so the delete path cannot reach it.
+
+    ``BEGIN IMMEDIATE`` serializes against that cascade, and the group is DERIVED
+    inside the lock rather than assumed empty, so the write is correct in either
+    order: the cascade either finished before the read (its adoption preserved,
+    with the ``active`` status owning items implies) or waits until after this row
+    exists and adopts into it then.
+
+    Off the loop via ``run_to_completion``: taking the write lock is a blocking
+    wait on any concurrent writer, and a cancellation while the work item is still
+    queued must not drop a terminal state write.
+    """
+    kstore.db.execute("BEGIN IMMEDIATE")
+    try:
+        adopted = kstore.surviving_group_in_txn("artifact_item_state", source_id, slug)
+        _write_state_row(
+            kstore, source_id, slug, content_hash, adopted, name,
+            status="active" if adopted else "deduped", kind=kind)
+        kstore.db.execute("COMMIT")
+    except Exception:
+        kstore.db.execute("ROLLBACK")
+        raise
+
+
 def _set_state(
     kstore: KnowledgeStore,
     source_id: str,
@@ -179,6 +219,23 @@ def _set_state(
     ``INSERT OR REPLACE``: omitting it would reset a ``deduped`` marker back to
     the column default, and the artifact would be re-ingested and re-collapsed on
     every event."""
+    _write_state_row(kstore, source_id, slug, content_hash, item_ids, name,
+                     status=status, kind=kind)
+    kstore.db.commit()
+
+
+def _write_state_row(
+    kstore: KnowledgeStore,
+    source_id: str,
+    slug: str,
+    content_hash: str,
+    item_ids: list[str],
+    name: str,
+    status: str = "active",
+    kind: str | None = None,
+) -> None:
+    """The row write alone, with no transaction control, so a caller already
+    holding one can include it."""
     now = datetime.now().isoformat()
     kstore.db.execute(
         "INSERT OR REPLACE INTO artifact_item_state "
@@ -195,7 +252,6 @@ def _set_state(
             kind,
         ),
     )
-    kstore.db.commit()
 
 
 def refresh_artifact_name(
@@ -398,16 +454,9 @@ async def ingest_artifact(
         # items on the way out. Record that: leaving the prior state would point
         # at deleted items and make every subsequent artifact event re-attempt a
         # write the gate will refuse again.
-        _set_state(
-            kstore,
-            source_id,
-            slug,
-            content_hash,
-            [],
-            title,
-            status="deduped",
-            kind=art.kind,
-        )
+        await run_to_completion(
+            lambda: _record_deduped_state(
+                kstore, source_id, slug, content_hash, title, art.kind))
         return job_id
     if status != "completed":
         # Partial/failed ingest: ingest_file kept the old group and rolled back

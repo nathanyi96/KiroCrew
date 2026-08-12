@@ -33,7 +33,7 @@ from datetime import datetime
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 
-from .ingestion import DUPLICATE_JOB_STATUS, IngestionPipeline
+from .ingestion import DUPLICATE_JOB_STATUS, IngestionPipeline, run_to_completion
 from .store import KnowledgeStore
 
 logger = logging.getLogger(__name__)
@@ -147,6 +147,39 @@ def get_state(store: KnowledgeStore, source_id: str, slug: str) -> tuple[str | N
     return row["content_hash"], ids
 
 
+def _record_deduped_state(store: KnowledgeStore, source_id: str, slug: str,
+                          content_hash: str, name: str) -> None:
+    """Terminal write for a document the pre-ingest gate refused, under the lock.
+
+    The gate commits its own transaction before returning, so a concurrent
+    ``delete_source_cascade`` on the holder can land between that commit and this
+    write: it reassigns the surviving item to this source and adopts it into this
+    very ``agent_item_state`` row. Writing an empty group afterwards -- which "the
+    gate refused, so this document owns nothing" predicts -- erases the adoption
+    and leaves the last copy of the content owned by this source but named by no
+    row, so the delete path cannot reach it.
+
+    ``BEGIN IMMEDIATE`` serializes against that cascade, and the group is DERIVED
+    inside the lock rather than assumed empty, so the write is correct in either
+    order. Off the loop via ``run_to_completion``, because taking the write lock
+    is a blocking wait on any concurrent writer.
+
+    A row that ends up owning items must be ``active``, not ``deduped``:
+    ``find_document_by_hash`` only matches ``active``, and a row that owns the
+    content while reporting ``deduped`` would let identical text in again under a
+    second slug.
+    """
+    store.db.execute("BEGIN IMMEDIATE")
+    try:
+        adopted = store.surviving_group_in_txn("agent_item_state", source_id, slug)
+        _write_state_row(store, source_id, slug, content_hash, adopted, name,
+                         status="active" if adopted else "deduped")
+        store.db.execute("COMMIT")
+    except Exception:
+        store.db.execute("ROLLBACK")
+        raise
+
+
 def set_state(store: KnowledgeStore, source_id: str, slug: str, content_hash: str,
               item_ids: list[str], name: str, status: str = "active") -> None:
     """Record one document's hash, item group, display name and status.
@@ -156,6 +189,16 @@ def set_state(store: KnowledgeStore, source_id: str, slug: str, content_hash: st
     marker back to the column default and the document would be re-ingested and
     re-collapsed on every pass.
     """
+    _write_state_row(store, source_id, slug, content_hash, item_ids, name,
+                     status=status)
+    store.db.commit()
+
+
+def _write_state_row(store: KnowledgeStore, source_id: str, slug: str,
+                     content_hash: str, item_ids: list[str], name: str,
+                     status: str = "active") -> None:
+    """The row write alone, with no transaction control, so a caller already
+    holding one can include it."""
     store.db.execute(
         "INSERT OR REPLACE INTO agent_item_state "
         "(source_id, slug, content_hash, item_ids, updated_at, name, status) "
@@ -163,7 +206,6 @@ def set_state(store: KnowledgeStore, source_id: str, slug: str, content_hash: st
         (source_id, slug, content_hash, json.dumps(item_ids),
          datetime.now().isoformat(), name, status),
     )
-    store.db.commit()
 
 
 def find_document_by_hash(store: KnowledgeStore, source_id: str, content_hash: str,
@@ -352,7 +394,8 @@ async def _add_agent_document(
         # no longer exist -- otherwise every later add would re-attempt from a
         # dead group. The hash IS stored, so re-adding the same text is a cheap
         # no-op instead of a repeated gate round-trip.
-        set_state(store, source_id, slug, content_hash, [], title, status="deduped")
+        await run_to_completion(
+            lambda: _record_deduped_state(store, source_id, slug, content_hash, title))
         return {"status": "duplicate",
                 "reason": "this content is already in the knowledge library",
                 "slug": slug, "source_id": source_id}
