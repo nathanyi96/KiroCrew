@@ -43,7 +43,7 @@ wrapped in `_require_enabled` (returns 403 when the app is disabled).
 | GET | `/pull-ai` | AI summary of a PR (description + whole conversation + check state), cached against a fingerprint that hashes the conversation's CONTENT — so an edited comment invalidates it, not just a new one |
 | POST | `/labels/apply` | Apply label changes (add/remove) |
 | POST | `/issue/state` | Close/reopen an issue |
-| GET/PUT | `/investigation` | Per-issue investigation record. The PUT is the ONE app route also reachable with the gateway internal secret (`_MIXED_INTERNAL_API_PATHS`), because it is the write behind the `issue_radar_record_investigation` MCP tool — see [Recording findings](#recording-findings) |
+| GET/PUT | `/investigation` | Per-item investigation record, addressed by `kind` (number sequence) and optional `verb` (which job) — see [One record per item, per verb](#one-record-per-item-per-verb). The PUT is the ONE app route also reachable with the gateway internal secret (`_MIXED_INTERNAL_API_PATHS`), because it is the write behind the `issue_radar_record_investigation` MCP tool — see [Recording findings](#recording-findings) |
 | GET | `/dispatch-readiness` | Whether an issue in this repo may be handed to an implementation attempt, plus a machine-readable `reason` — see [Dispatch readiness](#dispatch-readiness) |
 | POST | `/repo/local-path` | Record a connected repo's local checkout. `local_path` is REQUIRED; an explicit `""` clears it and an omitted field is a 400. Validates and REFUSES; never falls back to a directory the user did not name |
 | GET/POST | `/recommendations` | AI label taxonomy recommendations |
@@ -158,6 +158,30 @@ triage prompt. When the agent concludes it writes its verdict back into the
 item's investigation record — that is what puts a verdict + summary on the
 issue's card instead of leaving it in chat scrollback.
 
+### One record per item, per verb
+
+A record holds exactly one `slot_key`, so two things address it: `kind` and
+`verb`. They are orthogonal, and both are folded into the filename.
+
+`kind` says which **number sequence** the item came from. GitHub draws issues and
+pull requests from one sequence, so `#5` is unambiguous and keeps the historical
+`investigation-<N>.json`. GitLab keeps two, so merge request `!5` gets
+`investigation-mr-<N>.json` — sharing the issue's file would make "Review MR !5"
+resume issue #5's session.
+
+`verb` says which **job** is being done on that item, for the case where a person
+runs two of them at once on one change request. An omitted verb is the item's
+primary record. An unknown verb is refused with a 400 rather than folded to the
+primary record: folding would silently produce the collision the dimension exists
+to prevent, and `store.investigation_path` raises on one too, so the route
+validation is not the only gate.
+
+Findings always belong to the primary record. Every agent-side write arrives
+through the MCP tool below, which sends no verb — so a verb record carries a
+session link and nothing else, and the browser is the only writer that names one.
+
+### Why the write goes through an MCP tool
+
 That write goes through the **`issue_radar_record_investigation` MCP tool**, not
 a raw HTTP call. An agent session holds no dashboard credential:
 
@@ -216,6 +240,8 @@ repos/<owner>/<repo>/
   recommendations-cache.json        # AI label taxonomy
   tagging-cache.json                # Per-issue label proposals for the untagged queue
   investigation-<N>.json            # Per-issue investigation record
+  investigation-mr-<N>.json         # GitLab merge request (its own number sequence)
+  investigation-<verb>-<N>.json     # A second session verb on that item
   watch-state.json                  # Watcher high-water mark
 ```
 
