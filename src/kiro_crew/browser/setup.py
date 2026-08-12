@@ -1223,6 +1223,14 @@ def migrate_owned_playwright_registration() -> None:
     _migrate_owned_kiro_registration()
     _converge_kirocrew_mcp_json()
     _converge_playwright_agent_files()
+    # ON-side agent-config reconcile (symmetric with the OFF branch's
+    # _remove_playwright_from_agent_files above): converge only COLLAPSES existing
+    # duplicate proxy entries — it never ADDS the proxy where the owned agent
+    # config lacks it. Without this, a kirocrew.json last materialized while Mode
+    # was off keeps zero browser_* tools across every restart until a manual
+    # off->on toggle. Runs after the mcp.json rewrites so the spec it mounts is
+    # the canonical proxy those steps just ensured.
+    _ensure_playwright_in_agent_files()
 
 
 def _migrate_owned_kiro_registration() -> None:
@@ -1505,6 +1513,102 @@ def remove_playwright_servers(config: dict) -> bool:
     return True
 
 
+def _registered_playwright_spec(canonical: str) -> "dict | None":
+    """The canonical Playwright PROXY spec as registered in kiro's ``mcp.json``.
+
+    Returns ``None`` when kiro's ``mcp.json`` is absent, unreadable, or the
+    canonical key is missing / holds a user's DIRECT (non-proxy) server. A
+    ``None`` here means "the proxy is not registered/resolvable", which is
+    exactly the condition under which :func:`add_playwright_servers` must mount
+    nothing — the enable invariant is *mode on AND proxy registered*, not mode
+    on alone.
+    """
+    mcp_json = _kiro_mcp_json_path()
+    if not mcp_json.is_file():
+        return None
+    try:
+        data = json.loads(mcp_json.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    servers = data.get("mcpServers") if isinstance(data, dict) else None
+    spec = servers.get(canonical) if isinstance(servers, dict) else None
+    return spec if _spec_is_proxy(spec) else None
+
+
+def add_playwright_servers(config: dict) -> bool:
+    """Ensure the canonical Playwright proxy is MOUNTED in ``config`` when Browser
+    Mode is on and the proxy is registered. The inverse of
+    :func:`remove_playwright_servers`; mutates in place, returns ``True`` iff
+    anything changed.
+
+    This is the ON-side counterpart the codebase previously lacked: OFF was
+    enforced at the agent-config level (``remove_playwright_servers`` via
+    :func:`deregister_playwright_proxy` / the boot migration), but ON relied on a
+    full ``rebuild_agent_config`` that neither gateway boot nor the Settings
+    toggle triggers — so a config last materialized while Mode was off never
+    regained ``@playwright-mcp`` and a fresh session saw zero ``browser_*`` tools
+    until the operator toggled off->on. This closes that asymmetry.
+
+    Guarantees:
+      * gated on :func:`browser_mode_enabled` — "off means off" is preserved;
+      * mounts the proxy SPEC (as registered in kiro's ``mcp.json``) only when
+        the canonical key is ABSENT — an already-present proxy spec is left
+        exactly as-is, so a rebuild's command-resolved entry is never clobbered
+        back to the unresolved ``mcp.json`` form;
+      * never touches a user's DIRECT (non-proxy) server under the canonical key
+        (authorship is by launch target, mirroring register/deregister);
+      * ``tools``-only mount, never ``allowedTools`` — the PreToolUse gate governs
+        approval, matching how the shared-server sync mounts user MCP servers.
+    """
+    if not browser_mode_enabled():
+        return False
+    servers = config.get("mcpServers")
+    if not isinstance(servers, dict):
+        servers = config["mcpServers"] = {}
+    canonical = mcp_server_alias(_PLAYWRIGHT_MCP_PACKAGE)
+    existing = servers.get(canonical)
+    changed = False
+    if existing is None:
+        # Not present: mount the proxy spec kiro's mcp.json carries. Absent there
+        # (proxy not registered / not resolvable) => nothing to mount.
+        spec = _registered_playwright_spec(canonical)
+        if spec is None:
+            return False
+        servers[canonical] = spec
+        changed = True
+    elif not _spec_is_proxy(existing):
+        # A user's own direct server holds the canonical key — never clobber it,
+        # and do not mount our @ref onto their server.
+        return False
+    # else: an existing proxy spec (rebuild-resolved or written by a prior sweep)
+    # is left untouched; only its @ref is ensured below.
+    ref = f"@{canonical}"
+    tools = config.get("tools")
+    if not isinstance(tools, list):
+        tools = config["tools"] = []
+    if ref not in tools:
+        tools.append(ref)
+        changed = True
+    if changed:
+        logger.info("Mounted Playwright proxy %r (Browser Mode enabled)", canonical)
+    return changed
+
+
+def reconcile_playwright_in_config(config: dict) -> bool:
+    """Make :func:`browser_mode_enabled` the SINGLE SOURCE OF TRUTH for the
+    Playwright proxy in an agent ``config``. Mutates in place, returns ``True``
+    iff anything changed.
+
+    * Mode ON  -> :func:`add_playwright_servers` (mount when registered);
+    * Mode OFF -> :func:`remove_playwright_servers` (scrub server + ``@`` refs so
+      a stale ON-era entry can never regress into a mounted ``browser_*`` tool
+      set on a rebuild).
+    """
+    if browser_mode_enabled():
+        return add_playwright_servers(config)
+    return remove_playwright_servers(config)
+
+
 def _owned_agent_config_files() -> list[Path]:
     """The EXACT agent-config files Kiro Crew generates that exist on disk.
 
@@ -1587,6 +1691,18 @@ def _remove_playwright_from_agent_files() -> None:
     config that still carried the proxy.
     """
     _apply_to_owned_agent_files(remove_playwright_servers)
+
+
+def _ensure_playwright_in_agent_files() -> None:
+    """Sweep the agent configs Kiro Crew generates, ADDING the canonical proxy
+    server + its ``@playwright-mcp`` tool ref where absent. The inverse of
+    :func:`_remove_playwright_from_agent_files`; runs when Browser Mode is on
+    (gateway boot migration + :func:`register_playwright_proxy`) so the primary
+    agent regains the ``browser_*`` tools at EVERY boot — not only after a manual
+    off->on toggle. No-op on a config that already mounts the proxy, and on any
+    host where the proxy is not registered (nothing to mount).
+    """
+    _apply_to_owned_agent_files(add_playwright_servers)
 
 
 # Sidecar manifest recording the MCP server keys KiroCrew itself has written.
@@ -1838,6 +1954,14 @@ def register_playwright_proxy() -> tuple[Path, str]:
         else:
             mcp_json.write_text(json.dumps({"mcpServers": {}}, indent=2), encoding="utf-8")
         _patch_mcp_for_mode_unlocked()
+    # Mount the proxy into the generated agent configs too — symmetric with
+    # deregister_playwright_proxy, which scrubs them. Registration writes only
+    # kiro's mcp.json, but the primary agent spec has ``includeMcpJson: false``
+    # and a CLOSED ``tools`` allowlist, so an mcp.json entry alone never reaches
+    # its tool surface; without this the browser_* tools appear only after a full
+    # rebuild_agent_config, which the dashboard toggle does not trigger. Outside
+    # the mcp.lock: the agent files have their own atomic writes.
+    _ensure_playwright_in_agent_files()
     return mcp_json, "registered"
 
 

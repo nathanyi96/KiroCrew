@@ -4375,3 +4375,55 @@ def test_ensure_agent_materialized_swallows_errors(tmp_path, monkeypatch):
 
     managed = Path(agent_mod.AGENT_FILENAME).stem
     assert agent_mod.ensure_agent_materialized(managed) is False
+
+
+class TestBrowserModeReconcileOnRebuild:
+    """rebuild_agent_config makes browser_mode_enabled() the single source of
+    truth for the Playwright proxy on the primary agent."""
+
+    _PROXY = {"command": "/usr/bin/kirocrew", "args": ["mcp-playwright-proxy", "--config", "x"]}
+
+    def test_mode_on_mounts_playwright_ref(self, tmp_path: Path):
+        cfg_dir = _bundled_defaults(tmp_path)
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch("kiro_crew.browser.setup.browser_mode_enabled", return_value=True)
+            )
+            stack.enter_context(patch("kiro_crew.agent.browser_mode_enabled", return_value=True))
+            stack.enter_context(
+                patch(
+                    "kiro_crew.browser.setup._registered_playwright_spec",
+                    return_value=dict(self._PROXY),
+                )
+            )
+            path = _run_install(tmp_path, cfg_dir)
+        config = json.loads(path.read_text(encoding="utf-8"))
+        assert "playwright-mcp" in config["mcpServers"]
+        assert "@playwright-mcp" in config["tools"]
+        # tools-only mount — never auto-approved.
+        assert "@playwright-mcp" not in config.get("allowedTools", [])
+
+    def test_mode_off_scrubs_carried_over_proxy(self, tmp_path: Path):
+        cfg_dir = _bundled_defaults(tmp_path)
+        kiro_dir = tmp_path / "kiro_agents"
+        kiro_dir.mkdir(exist_ok=True)
+        # Existing config carries a stale ON-era proxy + its refs.
+        existing = {
+            "model": "claude-user-custom",
+            "tools": ["@playwright-mcp", "ReadFile"],
+            "allowedTools": ["@playwright-mcp"],
+            "mcpServers": {"playwright-mcp": dict(self._PROXY)},
+            "toolsSettings": {"execute_bash": {"deniedCommands": []}},
+            "hooks": {},
+        }
+        (kiro_dir / "kirocrew.json").write_text(json.dumps(existing))
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch("kiro_crew.browser.setup.browser_mode_enabled", return_value=False)
+            )
+            stack.enter_context(patch("kiro_crew.agent.browser_mode_enabled", return_value=False))
+            path = _run_install(tmp_path, cfg_dir)
+        config = json.loads(path.read_text(encoding="utf-8"))
+        assert "playwright-mcp" not in config["mcpServers"]
+        assert "@playwright-mcp" not in config["tools"]
+        assert "@playwright-mcp" not in config.get("allowedTools", [])
