@@ -147,4 +147,33 @@ describe('issueRadarApi investigation records', () => {
     expect(body.kind).toBe('pull')
     expect(body.provider).toBe('gitlab')
   })
+
+  // The verb is the same class of break one layer along: two JOBS on one change
+  // request share a record if it never reaches the wire, so answering the feedback
+  // on a PR would resume the review session and overwrite its link.
+  it('sends the session verb when reading a record', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(200, { investigation: null }))
+    await issueRadarApi.getInvestigation(GL, 5, 'pull', 'respond')
+    expect(fetchMock.mock.calls[0][0]).toContain('verb=respond')
+  })
+
+  it('sends the session verb when writing a record', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(200, { investigation: null }))
+    await issueRadarApi.saveInvestigation(GL, 5, { slot_key: 's1' }, 'pull', 'respond')
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string)
+    expect(body.verb).toBe('respond')
+  })
+
+  // Omitted rather than sent as null/undefined: the route validates the FIELD, and
+  // findings belong on the primary record, which is what every agent write targets.
+  it('omits the verb entirely when none is given', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(200, { investigation: null }))
+    await issueRadarApi.saveInvestigation(GL, 5, { findings: { verdict: 'dupe' } }, 'pull')
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string)
+    expect('verb' in body).toBe(false)
+    fetchMock.mockClear()
+    fetchMock.mockResolvedValue(jsonResponse(200, { investigation: null }))
+    await issueRadarApi.getInvestigation(GL, 5, 'pull')
+    expect(fetchMock.mock.calls[0][0]).not.toContain('verb=')
+  })
 })

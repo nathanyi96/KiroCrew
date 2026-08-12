@@ -774,13 +774,31 @@ export interface InvestigationRecord {
  * items that must not share one investigation record. */
 export type ItemKind = 'issue' | 'pull'
 
+/** Which SESSION VERB a record belongs to, for the case where one change request
+ * carries two jobs at once. Orthogonal to `ItemKind`: that says which number
+ * sequence the item came from, this says which job is being done on it. Omitted
+ * means the item's primary record, which is where findings live. */
+export type RecordVerb = 'respond'
+
 export interface InvestigationResponse {
   owner: string
   repo: string
   number: number
   kind?: ItemKind
+  verb?: RecordVerb | null
   /** null when the issue has never been investigated. */
   investigation: InvestigationRecord | null
+}
+
+/** Whether a repo can host work that edits code. `reason` distinguishes "no path
+ * recorded" from "the recorded path broke", because those ask the user for
+ * different things; `local_path` is the RESOLVED path the server accepted. */
+export interface DispatchReadinessResponse {
+  owner: string
+  repo: string
+  ready: boolean
+  reason: string
+  local_path: string
 }
 
 /** Fields the Investigate flow (or the agent) may patch onto a record. Partial
@@ -1568,29 +1586,49 @@ export const issueRadarApi = {
     return r.json()
   },
 
-  /** Read an issue's investigation record (`investigation` is null if the issue
-   * has never been investigated). */
+  /** Read an item's investigation record (`investigation` is null if the item has
+   * never been investigated). `verb` selects a per-session-verb record; omitted,
+   * the answer is the item's primary record. */
   getInvestigation: async (
-    ref: RepoRef, number: number, kind: ItemKind = 'issue',
+    ref: RepoRef, number: number, kind: ItemKind = 'issue', verb?: RecordVerb,
   ): Promise<InvestigationResponse> => {
     const q = new URLSearchParams({ ...repoQuery(ref), number: String(number), kind })
+    if (verb) q.set('verb', verb)
     const r = await fetch(`${API}/investigation?${q.toString()}`, { credentials: 'same-origin' })
     if (!r.ok) throw new Error(await parseErrorBody(r))
     return r.json()
   },
 
-  /** Upsert an issue's investigation record — link the session (slot_key +
+  /** Upsert an item's investigation record — link the session (slot_key +
    * folder_id), bump status, or store findings. The server merges + normalizes,
    * so a partial patch (even `{}`, which just bumps the last-opened stamp on
-   * resume) is valid. */
+   * resume) is valid.
+   *
+   * `verb` addresses one session verb's record, so two verbs on one change
+   * request do not overwrite each other's `slot_key`. Findings belong on the
+   * primary record, so a findings write leaves it unset. */
   saveInvestigation: async (
-    ref: RepoRef, number: number, patch: InvestigationPatch, kind: ItemKind = 'issue',
+    ref: RepoRef, number: number, patch: InvestigationPatch,
+    kind: ItemKind = 'issue', verb?: RecordVerb,
   ): Promise<InvestigationResponse> => {
     const r = await fetch(`${API}/investigation`, {
       method: 'PUT',
       credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...repoBody(ref), number, kind, ...patch }),
+      body: JSON.stringify({ ...repoBody(ref), number, kind, ...(verb ? { verb } : {}), ...patch }),
+    })
+    if (!r.ok) throw new Error(await parseErrorBody(r))
+    return r.json()
+  },
+
+  /** Whether this repo can hand work to an agent that edits code: a local
+   * repository must be recorded and still be a usable git checkout. Readiness is
+   * re-derived server-side on every read, so a checkout deleted after being
+   * recorded stops reporting ready. */
+  dispatchReadiness: async (ref: RepoRef): Promise<DispatchReadinessResponse> => {
+    const q = new URLSearchParams(repoQuery(ref))
+    const r = await fetch(`${API}/dispatch-readiness?${q.toString()}`, {
+      credentials: 'same-origin',
     })
     if (!r.ok) throw new Error(await parseErrorBody(r))
     return r.json()

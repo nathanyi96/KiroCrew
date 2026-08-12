@@ -26,7 +26,7 @@ import { useNavigate } from 'react-router-dom'
 import { useAppDispatch } from '../../../store'
 import { createSlot, switchSlot, deleteSlot } from '../../../store/chatSlice'
 import { api } from '../../../api/client'
-import { issueRadarApi, type InvestigationRecord, type ItemKind, RepoRef } from '../api'
+import { issueRadarApi, type InvestigationRecord, type ItemKind, type RecordVerb, RepoRef } from '../api'
 
 /** One folder per connected repo groups all its sessions. */
 const FOLDER_PREFIX = 'Issue Radar - '
@@ -64,6 +64,11 @@ export interface OpenSessionArgs {
    * must pass `pull`, because on GitLab the two are numbered independently and a
    * shared record would resume the wrong session. */
   kind?: ItemKind
+  /** Which SESSION VERB this session is, when the item can carry more than one at
+   * a time. Omitted means the item's primary record. Two verbs sharing a record
+   * would share one `slot_key`, so the second click would resume the first verb's
+   * session and overwrite its link. */
+  verb?: RecordVerb
   /** Slot title, already formatted (e.g. "#123 · Fix the thing"). */
   title: string
   /** The fully-built seed prompt for the first turn. */
@@ -87,7 +92,7 @@ export function useAgentSession(): UseAgentSession {
   const [error, setError] = useState<Error | null>(null)
 
   const openSession = useCallback(
-    async ({ repoRef, number, kind = 'issue', title, prompt, existing }: OpenSessionArgs): Promise<InvestigationRecord | null> => {
+    async ({ repoRef, number, kind = 'issue', verb, title, prompt, existing }: OpenSessionArgs): Promise<InvestigationRecord | null> => {
       setBusy(true)
       // Set once a slot exists but is not yet linked to an investigation record;
       // cleared on success. See the rollback in the catch below.
@@ -112,7 +117,7 @@ export function useAgentSession(): UseAgentSession {
             if (!isMissingSlot(e)) throw e
           }
           if (resumed) {
-            const res = await issueRadarApi.saveInvestigation(repoRef, number, {}, kind)
+            const res = await issueRadarApi.saveInvestigation(repoRef, number, {}, kind, verb)
             navigate('/chat')
             return res.investigation
           }
@@ -151,7 +156,7 @@ export function useAgentSession(): UseAgentSession {
           slot_key: slot.key,
           folder_id: folderId,
           status: 'investigating',
-        }, kind)
+        }, kind, verb)
         await dispatch(switchSlot(slot.key)).unwrap().catch(() => {})
         navigate('/chat')
         return res.investigation

@@ -6,14 +6,16 @@ import {
   CheckCircle2, XCircle, CircleSlash, Loader2, FileDiff,
 } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
+import { useQuery } from '@tanstack/react-query'
 import { useIssueRadar } from '../context'
 import { relativeTimeOrDate, relativeTime } from '../lib/format'
-import type { PullRequest } from '../api'
+import { issueRadarApi, type PullRequest } from '../api'
 import LabelChip from './LabelChip'
 import ListSkeleton from './ListSkeleton'
 import ListEmptyState from './ListEmptyState'
 import PrBulkBar from './PrBulkBar'
-import { providerTerms } from '../lib/links'
+import PrRespondButton from './PrRespondButton'
+import { providerTerms, repoScopeKey } from '../lib/links'
 
 import { i18nT } from '../../../i18n/t'
 /** Above this many rendered rows we skip the per-card enter/layout animation
@@ -151,23 +153,43 @@ export default function PrList({ resizing = false }: { resizing?: boolean }) {
     return () => window.removeEventListener('keydown', onKey)
   }, [checkedPulls.size, clearCheckedPulls])
 
+  // ONE readiness read for the whole list, not one per row: whether a local
+  // checkout exists is a property of the REPO, so a per-row query would be up to
+  // ANIM_CAP identical subscriptions. An unresolved or failed read is treated as
+  // NOT ready — a session with nowhere to work is the failure the gate exists to
+  // prevent, so it fails closed.
+  const readinessQuery = useQuery({
+    queryKey: ['issue-radar', 'dispatch-readiness', repoScopeKey(active)],
+    queryFn: () => issueRadarApi.dispatchReadiness(active),
+    staleTime: 30_000,
+  })
+  const respondReady = readinessQuery.data?.ready === true
+  const respondLocalPath = readinessQuery.data?.local_path ?? ''
+  const respondNotReadyReason = readinessQuery.isLoading
+    ? i18nT('apps.issueRadar.components.prList.respond_checking')
+    : readinessQuery.data?.reason === 'checkout_unusable'
+      ? i18nT('apps.issueRadar.components.prList.respond_checkout_unusable')
+      : i18nT('apps.issueRadar.components.prList.respond_no_local_path')
+
   const cardClass = (isSel: boolean) =>
     `w-full text-left rounded-lg border p-2.5 cursor-pointer bg-card hover:bg-bg-hover transition-colors ${
       isSel ? 'border-accent' : 'border-border'
     }`
 
-  /** One row: the select checkbox beside the card, not inside it.
+  /** One row: the select checkbox and the respond control beside the card, not
+   * inside it.
    *
-   * A checkbox nested in the card's `<button>` would be invalid HTML (interactive
+   * A control nested in the card's `<button>` would be invalid HTML (interactive
    * content inside a button) and unreachable by keyboard, so the row is a flex
-   * container holding two siblings. The checkbox only renders on a writable repo —
-   * on a read-only one every bulk action would 403, so offering the selection at
-   * all would be a dead end.
+   * container holding siblings. The checkbox only renders on a writable repo — on a
+   * read-only one every bulk action would 403, so offering the selection at all
+   * would be a dead end. Respond is not gated that way: it reads the change request
+   * and works a local checkout, so it is useful on a repo this user cannot write
+   * through the provider, and its own gate is whether that checkout exists.
    */
-  const row = (pr: PullRequest, children: React.ReactNode) => {
-    if (!canWrite) return children
-    return (
-      <div className="flex items-start gap-1.5">
+  const row = (pr: PullRequest, children: React.ReactNode) => (
+    <div className="flex items-start gap-1.5">
+      {canWrite && (
         <input
           type="checkbox"
           checked={checkedPulls.has(pr.number)}
@@ -175,10 +197,17 @@ export default function PrList({ resizing = false }: { resizing?: boolean }) {
           aria-label={i18nT('apps.issueRadar.components.prList.select_for_bulk', { subject: terms.changeRequestShort, number: pr.number })}
           className="mt-3 flex-shrink-0 cursor-pointer accent-[var(--accent)]"
         />
-        <div className="min-w-0 flex-1">{children}</div>
-      </div>
-    )
-  }
+      )}
+      <div className="min-w-0 flex-1">{children}</div>
+      <PrRespondButton
+        repoRef={active}
+        pull={pr}
+        ready={respondReady}
+        notReadyReason={respondNotReadyReason}
+        localPath={respondLocalPath}
+      />
+    </div>
+  )
 
   const cardInner = (pr: PullRequest) => {
     const { Icon, color } = prStateVisual(pr)

@@ -30,8 +30,18 @@ const api = {
   pullRuns: vi.fn(),
   pullRunAction: vi.fn(),
   bulkPrAction: vi.fn(),
+  dispatchReadiness: vi.fn(),
+  getInvestigation: vi.fn(),
 }
 vi.mock('../apps/issue-radar/api', () => ({ issueRadarApi: api }))
+
+// The respond hook reaches the redux store and the router through
+// lib/agentSession; the contract this file asserts is what the ROW control asks it
+// for, so the hook itself is stubbed rather than dragging both providers in.
+const respondToPr = vi.fn()
+vi.mock('../apps/issue-radar/lib/respond', () => ({
+  useRespondToPr: () => ({ respondToPr, busy: false, error: null }),
+}))
 
 const ctx = { value: {} as Record<string, unknown> }
 vi.mock('../apps/issue-radar/context', () => ({
@@ -41,6 +51,7 @@ vi.mock('../apps/issue-radar/context', () => ({
 const PrActionsBar = (await import('../apps/issue-radar/components/PrActionsBar')).default
 const PrBulkBar = (await import('../apps/issue-radar/components/PrBulkBar')).default
 const PrRunActions = (await import('../apps/issue-radar/components/PrRunActions')).default
+const PrList = (await import('../apps/issue-radar/components/PrList')).default
 const { BULK_PR_CLOSE_TOKEN, SEQUENTIAL_MERGE_TOKEN } = await import('../apps/issue-radar/components/PrBulkBar')
 
 const REF = { owner: 'o', repo: 'r' }
@@ -1547,5 +1558,133 @@ describe('PrRunActions', () => {
     await userEvent.click(await screen.findByRole('button', { name: /re-run Nightly/i }))
     await waitFor(() =>
       expect(api.pullRunAction).toHaveBeenCalledWith(REF, 7, 3, 'rerun', false))
+  })
+})
+
+// ── the respond control on a list row ────────────────────────────────────────
+//
+// Answering the feedback a change request received is the AUTHOR's seat, and a
+// different job from Review, which drafts a review of somebody else's change and is
+// forbidden from writing anything. The two run concurrently on one number, so the
+// load-bearing assertions here are about not confusing them, and about not offering
+// a session that has nowhere to do the work:
+//
+//  * The record read carries BOTH kind 'pull' and verb 'respond'. Dropping the verb
+//    addresses Review's record, so "Resume" would reattach to the review session and
+//    the link write would overwrite it.
+//  * Readiness fails CLOSED. A session with no local checkout cannot push, and
+//    guessing a directory is the failure the gate exists to prevent — so loading and
+//    errored both read as not-ready, not as ready.
+//  * A FAILED record lookup opens nothing. Treating it as "no session exists" would
+//    start a second session and orphan the one the user already has.
+//  * Readiness is read ONCE per list. It is a property of the repo, so a per-row
+//    query would be up to 200 identical subscriptions.
+//  * The control survives a read-only repo. It reads the change request and works a
+//    local checkout, so provider write permission is not its gate — unlike the bulk
+//    checkbox beside it, which would only ever 403.
+describe('PrList — the respond control', () => {
+  const listCtx = (over: Record<string, unknown> = {}) => ({
+    filteredPulls: [PULL],
+    sortedPulls: [PULL],
+    pullsLoading: false,
+    pullsError: null,
+    pullsPartial: false,
+    prStateFilter: 'open',
+    colorByName: new Map<string, string>(),
+    selectedPull: null,
+    setSelectedPull: vi.fn(),
+    refreshPulls: vi.fn(),
+    pullsRefreshing: false,
+    prQuery: '',
+    setPrQuery: vi.fn(),
+    pullsUpdatedAt: null,
+    prPersonFilterActive: false,
+    prSearchTruncatedAt: null,
+    active: REF,
+    canWrite: true,
+    checkedPulls: new Set<number>(),
+    togglePullChecked: vi.fn(),
+    clearCheckedPulls: vi.fn(),
+    ...over,
+  })
+
+  const ready = { ...REF, ready: true, reason: '', local_path: '/repos/r' }
+
+  beforeEach(() => {
+    respondToPr.mockReset()
+    respondToPr.mockResolvedValue(null)
+    api.dispatchReadiness.mockReset()
+    api.getInvestigation.mockReset()
+    api.dispatchReadiness.mockResolvedValue(ready)
+    api.getInvestigation.mockResolvedValue({ ...REF, number: 7, investigation: null })
+    ctx.value = listCtx()
+  })
+
+  const control = () => screen.findByRole('button', { name: /answer the feedback/i })
+
+  it('reads the record for the respond verb, not the review verb', async () => {
+    wrap(<PrList />)
+    await userEvent.click(await control())
+    await waitFor(() =>
+      expect(api.getInvestigation).toHaveBeenCalledWith(REF, 7, 'pull', 'respond'))
+  })
+
+  it('resumes the existing respond session and names the local repository', async () => {
+    const record = { owner: 'o', repo: 'r', number: 7, slot_key: 'chat-9', folder_id: 'f1' }
+    api.getInvestigation.mockResolvedValue({ ...REF, number: 7, investigation: record })
+    wrap(<PrList />)
+    await userEvent.click(await control())
+    await waitFor(() =>
+      expect(respondToPr).toHaveBeenCalledWith(REF, PULL, '/repos/r', record))
+  })
+
+  it('opens nothing when the record lookup fails', async () => {
+    api.getInvestigation.mockRejectedValue(new Error('boom'))
+    wrap(<PrList />)
+    await userEvent.click(await control())
+    await waitFor(() => expect(api.getInvestigation).toHaveBeenCalled())
+    expect(respondToPr).not.toHaveBeenCalled()
+  })
+
+  it('is disabled with the reason when no local repository is recorded', async () => {
+    api.dispatchReadiness.mockResolvedValue({
+      ...REF, ready: false, reason: 'no_local_path', local_path: '',
+    })
+    wrap(<PrList />)
+    await waitFor(async () => expect(await control()).toBeDisabled())
+    expect((await control()).getAttribute('title')).toMatch(/in Settings/i)
+  })
+
+  it('says the recorded repository broke, rather than that none is set', async () => {
+    api.dispatchReadiness.mockResolvedValue({
+      ...REF, ready: false, reason: 'checkout_unusable', local_path: '/gone',
+    })
+    wrap(<PrList />)
+    await waitFor(async () =>
+      expect((await control()).getAttribute('title')).toMatch(/no longer usable/i))
+  })
+
+  it('fails closed when readiness cannot be read', async () => {
+    api.dispatchReadiness.mockRejectedValue(new Error('offline'))
+    wrap(<PrList />)
+    await waitFor(async () => expect(await control()).toBeDisabled())
+    await userEvent.click(await control())
+    expect(respondToPr).not.toHaveBeenCalled()
+  })
+
+  it('reads readiness once for the whole list, not once per row', async () => {
+    ctx.value = listCtx({ filteredPulls: [PULL, PULL_8], sortedPulls: [PULL, PULL_8] })
+    wrap(<PrList />)
+    await waitFor(() => expect(api.dispatchReadiness).toHaveBeenCalled())
+    expect(screen.getAllByRole('button', { name: /answer the feedback/i })).toHaveLength(2)
+    expect(api.dispatchReadiness).toHaveBeenCalledTimes(1)
+  })
+
+  it('is offered on a read-only repo, where the bulk checkbox is not', async () => {
+    ctx.value = listCtx({ canWrite: false })
+    wrap(<PrList />)
+    // Enabled only once readiness RESOLVES — it starts disabled by design.
+    await waitFor(async () => expect(await control()).toBeEnabled())
+    expect(screen.queryByRole('checkbox', { name: /select/i })).toBeNull()
   })
 })
