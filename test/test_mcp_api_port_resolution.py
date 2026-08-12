@@ -10,14 +10,18 @@ Two halves of one defect:
   had nothing better than that guess to inherit.
 
 These tests lock in the fix: ``mcp_core`` resolves lazily through
-``cli_server.resolve_client_port`` (env → explicit config port → live
-run-marker → default), and the dashboard server exports ``KIROCREW_BOUND_PORT``
-once its TCP site is listening.
+``port_resolution.resolve_client_port_ex`` (env → explicit config port → live
+run-marker → default; re-exported by ``cli_server``, whose namespace the
+chain-internal calls still resolve through so the patches below intercept),
+and the dashboard server exports ``KIROCREW_BOUND_PORT`` once its TCP site is
+listening.
 """
 
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -205,3 +209,29 @@ class TestExportBoundPort:
         monkeypatch.setenv("KIROCREW_BOUND_PORT", "1111")
         _export_bound_port(_StubRunner([]), 6776)
         assert os.environ["KIROCREW_BOUND_PORT"] == "6776"
+
+
+class TestPortResolutionStaysLeaf:
+    """``port_resolution`` exists so the MCP stdio server never pays for
+    ``cli_server``'s import graph (frontend build, service controllers,
+    preflight, embeddings). Lock that in: importing either the leaf or
+    ``mcp_core`` in a fresh interpreter must not pull ``cli_server`` in.
+    A fresh interpreter is required — this suite itself imports
+    ``cli_server``, so an in-process ``sys.modules`` check would always
+    see it loaded.
+    """
+
+    @pytest.mark.parametrize(
+        "module", ["kiro_crew.port_resolution", "kiro_crew.mcp_core"]
+    )
+    def test_import_does_not_pull_cli_server(self, module: str) -> None:
+        code = (
+            "import importlib, sys; "
+            f"importlib.import_module({module!r}); "
+            "assert 'kiro_crew.cli_server' not in sys.modules, "
+            f"'importing {module} pulled in the heavy cli_server graph'"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True, timeout=120
+        )
+        assert proc.returncode == 0, proc.stderr
